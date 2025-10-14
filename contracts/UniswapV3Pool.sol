@@ -324,6 +324,7 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
             _slot0.tick
         );
 
+        // 根据实际的liquidityDelta重新计算需要的amount0和amount1
         if (params.liquidityDelta != 0) {
             if (_slot0.tick < params.tickLower) {
                 // current tick is below the passed range; liquidity can only become in range by crossing from left to
@@ -376,6 +377,7 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     /// @param tickLower the lower tick of the position's tick range
     /// @param tickUpper the upper tick of the position's tick range
     /// @param tick the current tick, passed to avoid sloads
+    // 根据tick和流动性，计算并且设置tickInside的单位流动性手续费
     function _updatePosition(
         address owner,
         int24 tickLower,
