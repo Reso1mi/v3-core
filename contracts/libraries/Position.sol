@@ -33,6 +33,7 @@ library Position {
         int24 tickLower,
         int24 tickUpper
     ) internal view returns (Position.Info storage position) {
+        // 访问不存在的kv, 会返回一个空的Info
         position = self[keccak256(abi.encodePacked(owner, tickLower, tickUpper))];
     }
 
