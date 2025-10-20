@@ -598,6 +598,16 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     }
 
     /// @inheritdoc IUniswapV3PoolActions
+    /**
+     * @notice 执行代币交换
+     * @param recipient 接收输出代币的地址
+     * @param zeroForOne 交换方向：true = 卖出token0买入token1，false = 卖出token1买入token0
+     * @param amountSpecified 指定的交换数量：正数 = 精确输入，负数 = 精确输出
+     * @param sqrtPriceLimitX96 价格限制（防止滑点过大）：zeroForOne=true时应小于当前价格，否则应大于当前价格
+     * @param data 传递给回调函数的数据
+     * @return amount0 token0的变化量（正数=池子收到，负数=池子支付）
+     * @return amount1 token1的变化量（正数=池子收到，负数=池子支付）
+     */
     function swap(
         address recipient,
         bool zeroForOne,
@@ -605,11 +615,20 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         uint160 sqrtPriceLimitX96,
         bytes calldata data
     ) external override noDelegateCall returns (int256 amount0, int256 amount1) {
+        // ========== 第一阶段：参数验证与初始化 ==========
+        
+        // 1. 验证交换数量不为0
         require(amountSpecified != 0, 'AS');
 
+        // 2. 保存当前状态快照（用于后续比较和恢复）
         Slot0 memory slot0Start = slot0;
 
+        // 3. 重入锁检查（防止重入攻击）
         require(slot0Start.unlocked, 'LOK');
+        
+        // 4. 价格限制验证
+        // zeroForOne=true（卖token0）：价格应下降，限制价格必须 < 当前价格 且 > 最小价格
+        // zeroForOne=false（卖token1）：价格应上升，限制价格必须 > 当前价格 且 < 最大价格
         require(
             zeroForOne
                 ? sqrtPriceLimitX96 < slot0Start.sqrtPriceX96 && sqrtPriceLimitX96 > TickMath.MIN_SQRT_RATIO
@@ -617,89 +636,117 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
             'SPL'
         );
 
+        // 5. 上锁（防止重入）
         slot0.unlocked = false;
 
+        // ========== 第二阶段：缓存和状态初始化 ==========
+        
+        // 创建交换缓存（存储不变的初始值）
         SwapCache memory cache =
             SwapCache({
-                liquidityStart: liquidity,
-                blockTimestamp: _blockTimestamp(),
-                feeProtocol: zeroForOne ? (slot0Start.feeProtocol % 16) : (slot0Start.feeProtocol >> 4),
-                secondsPerLiquidityCumulativeX128: 0,
-                tickCumulative: 0,
-                computedLatestObservation: false
+                liquidityStart: liquidity,              // 起始流动性（用于后续比较）
+                blockTimestamp: _blockTimestamp(),      // 当前区块时间戳
+                feeProtocol: zeroForOne ? (slot0Start.feeProtocol % 16) : (slot0Start.feeProtocol >> 4), // 协议费率
+                secondsPerLiquidityCumulativeX128: 0,   // 每单位流动性的累计秒数（延迟计算）
+                tickCumulative: 0,                      // tick累计值（延迟计算）
+                computedLatestObservation: false        // 是否已计算最新观察值
             });
 
+        // 判断是精确输入还是精确输出
+        // 正数 = 精确输入（指定输入数量，计算输出）
+        // 负数 = 精确输出（指定输出数量，计算输入）
         bool exactInput = amountSpecified > 0;
 
+        // 创建交换状态（会在循环中不断更新）
         SwapState memory state =
             SwapState({
-                amountSpecifiedRemaining: amountSpecified,
-                amountCalculated: 0,
-                sqrtPriceX96: slot0Start.sqrtPriceX96,
-                tick: slot0Start.tick,
-                feeGrowthGlobalX128: zeroForOne ? feeGrowthGlobal0X128 : feeGrowthGlobal1X128,
-                protocolFee: 0,
-                liquidity: cache.liquidityStart
+                amountSpecifiedRemaining: amountSpecified,  // 剩余待交换数量
+                amountCalculated: 0,                        // 已计算的输出/输入数量
+                sqrtPriceX96: slot0Start.sqrtPriceX96,     // 当前价格（会随交换更新）
+                tick: slot0Start.tick,                      // 当前tick（会随交换更新）
+                feeGrowthGlobalX128: zeroForOne ? feeGrowthGlobal0X128 : feeGrowthGlobal1X128, // 全局费用增长
+                protocolFee: 0,                             // 累计的协议费用
+                liquidity: cache.liquidityStart             // 当前流动性（会在跨tick时更新）
             });
 
-        // continue swapping as long as we haven't used the entire input/output and haven't reached the price limit
+        // ========== 第三阶段：核心交换循环 ==========
+        // 循环条件：还有剩余数量 且 未达到价格限制
         while (state.amountSpecifiedRemaining != 0 && state.sqrtPriceX96 != sqrtPriceLimitX96) {
             StepComputations memory step;
 
+            // 记录本步骤的起始价格
             step.sqrtPriceStartX96 = state.sqrtPriceX96;
 
+            // --- 步骤1：在一个word（256个tick）内找到下一个初始化的tick ---
+            // 返回值：
+            // - tickNext: 下一个tick位置（可能是初始化的tick，也可能是word边界）
+            // - initialized: 是否真的找到了初始化的tick
             (step.tickNext, step.initialized) = tickBitmap.nextInitializedTickWithinOneWord(
                 state.tick,
                 tickSpacing,
                 zeroForOne
             );
 
-            // ensure that we do not overshoot the min/max tick, as the tick bitmap is not aware of these bounds
+            // 边界检查：确保不超出全局tick范围
+            // （tickBitmap不知道全局边界，需要手动限制）
             if (step.tickNext < TickMath.MIN_TICK) {
                 step.tickNext = TickMath.MIN_TICK;
             } else if (step.tickNext > TickMath.MAX_TICK) {
                 step.tickNext = TickMath.MAX_TICK;
             }
 
-            // get the price for the next tick
+            // 获取下一个tick对应的价格
             step.sqrtPriceNextX96 = TickMath.getSqrtRatioAtTick(step.tickNext);
 
-            // compute values to swap to the target tick, price limit, or point where input/output amount is exhausted
+            // --- 步骤2：计算本步骤的交换结果 ---
+            // 目标价格：取 (下一个tick价格) 和 (价格限制) 中更接近当前价格的那个
+            // 这样可以确保不会超过用户设定的滑点限制
             (state.sqrtPriceX96, step.amountIn, step.amountOut, step.feeAmount) = SwapMath.computeSwapStep(
-                state.sqrtPriceX96,
+                state.sqrtPriceX96,                 // 当前价格
                 (zeroForOne ? step.sqrtPriceNextX96 < sqrtPriceLimitX96 : step.sqrtPriceNextX96 > sqrtPriceLimitX96)
-                    ? sqrtPriceLimitX96
-                    : step.sqrtPriceNextX96,
-                state.liquidity,
-                state.amountSpecifiedRemaining,
-                fee
+                    ? sqrtPriceLimitX96             // 如果下一个tick超过限制，使用价格限制
+                    : step.sqrtPriceNextX96,        // 否则使用下一个tick的价格
+                state.liquidity,                    // 当前流动性
+                state.amountSpecifiedRemaining,     // 剩余待交换数量
+                fee                                 // 手续费率
             );
 
+            // --- 步骤3：更新剩余数量和已计算数量 ---
             if (exactInput) {
+                // 精确输入模式：
+                // - 减少剩余输入（输入 + 手续费）
+                // - 增加已计算的输出（注意是负数，因为是池子支付）
                 state.amountSpecifiedRemaining -= (step.amountIn + step.feeAmount).toInt256();
                 state.amountCalculated = state.amountCalculated.sub(step.amountOut.toInt256());
             } else {
+                // 精确输出模式：
+                // - 增加剩余输出（因为amountSpecified是负数）
+                // - 增加已计算的输入（输入 + 手续费）
                 state.amountSpecifiedRemaining += step.amountOut.toInt256();
                 state.amountCalculated = state.amountCalculated.add((step.amountIn + step.feeAmount).toInt256());
             }
 
-            // if the protocol fee is on, calculate how much is owed, decrement feeAmount, and increment protocolFee
+            // --- 步骤4：处理协议费用 ---
+            // 如果设置了协议费用，从手续费中分出一部分给协议
             if (cache.feeProtocol > 0) {
-                uint256 delta = step.feeAmount / cache.feeProtocol;
-                step.feeAmount -= delta;
-                state.protocolFee += uint128(delta);
+                uint256 delta = step.feeAmount / cache.feeProtocol;  // 协议费用 = 总手续费 / feeProtocol
+                step.feeAmount -= delta;                              // 从LP费用中扣除
+                state.protocolFee += uint128(delta);                  // 累加到协议费用
             }
 
-            // update global fee tracker
+            // --- 步骤5：更新全局费用增长 ---
+            // 将本步骤的手续费（扣除协议费后）分配给所有LP
+            // feeGrowthGlobalX128 表示每单位流动性累计的手续费（Q128格式）
             if (state.liquidity > 0)
                 state.feeGrowthGlobalX128 += FullMath.mulDiv(step.feeAmount, FixedPoint128.Q128, state.liquidity);
 
-            // shift tick if we reached the next price
+            // --- 步骤6：处理tick跨越 ---
+            // 检查是否到达了下一个tick的价格
             if (state.sqrtPriceX96 == step.sqrtPriceNextX96) {
-                // if the tick is initialized, run the tick transition
+                // 只有当tick真的被初始化时才执行跨越操作
                 if (step.initialized) {
-                    // check for the placeholder value, which we replace with the actual value the first time the swap
-                    // crosses an initialized tick
+                    // 首次跨越初始化tick时，计算观察值（用于预言机）
+                    // 这是一个延迟计算的优化：只在真正需要时才计算
                     if (!cache.computedLatestObservation) {
                         (cache.tickCumulative, cache.secondsPerLiquidityCumulativeX128) = observations.observeSingle(
                             cache.blockTimestamp,
@@ -711,6 +758,9 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                         );
                         cache.computedLatestObservation = true;
                     }
+                    
+                    // 跨越tick，获取流动性变化量
+                    // cross函数会更新tick的外部累计值，并返回liquidityNet
                     int128 liquidityNet =
                         ticks.cross(
                             step.tickNext,
@@ -720,22 +770,31 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                             cache.tickCumulative,
                             cache.blockTimestamp
                         );
-                    // if we're moving leftward, we interpret liquidityNet as the opposite sign
-                    // safe because liquidityNet cannot be type(int128).min
+                    
+                    // 向左移动（zeroForOne=true）时，流动性变化取反
+                    // 原因：tick存储的是"从左向右跨越时"的流动性变化
+                    // 从右向左跨越时，需要反向应用这个变化
                     if (zeroForOne) liquidityNet = -liquidityNet;
 
+                    // 更新当前流动性
                     state.liquidity = LiquidityMath.addDelta(state.liquidity, liquidityNet);
                 }
 
+                // 更新当前tick
+                // 注意：向左移动时，当前tick = tickNext - 1（因为tick代表价格区间的左端点）
                 state.tick = zeroForOne ? step.tickNext - 1 : step.tickNext;
             } else if (state.sqrtPriceX96 != step.sqrtPriceStartX96) {
-                // recompute unless we're on a lower tick boundary (i.e. already transitioned ticks), and haven't moved
+                // 价格变化了但没有到达下一个tick（在tick内部移动）
+                // 需要重新计算当前tick（除非价格没变）
                 state.tick = TickMath.getTickAtSqrtRatio(state.sqrtPriceX96);
             }
-        }
+        } // while循环结束
 
-        // update tick and write an oracle entry if the tick change
+        // ========== 第四阶段：更新存储状态 ==========
+        
+        // 如果tick发生了变化，需要更新slot0和预言机
         if (state.tick != slot0Start.tick) {
+            // 写入新的预言机观察值
             (uint16 observationIndex, uint16 observationCardinality) =
                 observations.write(
                     slot0Start.observationIndex,
@@ -745,6 +804,7 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                     slot0Start.observationCardinality,
                     slot0Start.observationCardinalityNext
                 );
+            // 更新slot0的所有相关字段
             (slot0.sqrtPriceX96, slot0.tick, slot0.observationIndex, slot0.observationCardinality) = (
                 state.sqrtPriceX96,
                 state.tick,
@@ -752,43 +812,71 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                 observationCardinality
             );
         } else {
-            // otherwise just update the price
+            // tick没变，只更新价格（价格可能在tick内部移动）
             slot0.sqrtPriceX96 = state.sqrtPriceX96;
         }
 
-        // update liquidity if it changed
+        // 如果流动性发生了变化，更新全局流动性
         if (cache.liquidityStart != state.liquidity) liquidity = state.liquidity;
 
-        // update fee growth global and, if necessary, protocol fees
-        // overflow is acceptable, protocol has to withdraw before it hits type(uint128).max fees
+        // 更新全局费用增长和协议费用
+        // 注意：溢出是可接受的，协议需要在达到uint128.max之前提取费用
         if (zeroForOne) {
-            feeGrowthGlobal0X128 = state.feeGrowthGlobalX128;
-            if (state.protocolFee > 0) protocolFees.token0 += state.protocolFee;
+            feeGrowthGlobal0X128 = state.feeGrowthGlobalX128;  // 更新token0的费用增长
+            if (state.protocolFee > 0) protocolFees.token0 += state.protocolFee;  // 累加协议费用
         } else {
-            feeGrowthGlobal1X128 = state.feeGrowthGlobalX128;
-            if (state.protocolFee > 0) protocolFees.token1 += state.protocolFee;
+            feeGrowthGlobal1X128 = state.feeGrowthGlobalX128;  // 更新token1的费用增长
+            if (state.protocolFee > 0) protocolFees.token1 += state.protocolFee;  // 累加协议费用
         }
 
+        // ========== 第五阶段：计算最终金额 ==========
+        
+        // 根据交换方向和模式计算最终的amount0和amount1
+        // zeroForOne=true: 卖token0买token1，amount0为正（池子收到），amount1为负（池子支付）
+        // zeroForOne=false: 卖token1买token0，amount0为负（池子支付），amount1为正（池子收到）
         (amount0, amount1) = zeroForOne == exactInput
             ? (amountSpecified - state.amountSpecifiedRemaining, state.amountCalculated)
             : (state.amountCalculated, amountSpecified - state.amountSpecifiedRemaining);
 
-        // do the transfers and collect payment
+        // ========== 第六阶段：代币转账和回调验证 ==========
+        // 采用"先转出，后验证支付"的闪电贷模式
+        
         if (zeroForOne) {
+            // 卖token0买token1的情况
+            
+            // 1. 如果需要支付token1（amount1<0），先转给接收者
             if (amount1 < 0) TransferHelper.safeTransfer(token1, recipient, uint256(-amount1));
 
+            // 2. 记录转账前的token0余额
             uint256 balance0Before = balance0();
+            
+            // 3. 调用回调函数，调用者需要在回调中支付token0
             IUniswapV3SwapCallback(msg.sender).uniswapV3SwapCallback(amount0, amount1, data);
+            
+            // 4. 验证支付：检查余额增加是否足够（防止支付不足）
             require(balance0Before.add(uint256(amount0)) <= balance0(), 'IIA');
         } else {
+            // 卖token1买token0的情况（逻辑相同，token0和token1互换）
+            
+            // 1. 如果需要支付token0（amount0<0），先转给接收者
             if (amount0 < 0) TransferHelper.safeTransfer(token0, recipient, uint256(-amount0));
 
+            // 2. 记录转账前的token1余额
             uint256 balance1Before = balance1();
+            
+            // 3. 调用回调函数，调用者需要在回调中支付token1
             IUniswapV3SwapCallback(msg.sender).uniswapV3SwapCallback(amount0, amount1, data);
+            
+            // 4. 验证支付：检查余额增加是否足够（防止支付不足）
             require(balance1Before.add(uint256(amount1)) <= balance1(), 'IIA');
         }
 
+        // ========== 第七阶段：发出事件并解锁 ==========
+        
+        // 发出Swap事件，记录交换详情
         emit Swap(msg.sender, recipient, amount0, amount1, state.sqrtPriceX96, state.liquidity, state.tick);
+        
+        // 解锁，允许后续调用
         slot0.unlocked = true;
     }
 
