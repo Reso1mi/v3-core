@@ -101,14 +101,31 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     /// @dev Mutually exclusive reentrancy protection into the pool to/from a method. This method also prevents entrance
     /// to a function before the pool is initialized. The reentrancy guard is required throughout the contract because
     /// we use balance checks to determine the payment status of interactions such as mint, swap and flash.
+    /**
+     * @notice 重入锁：防止重入攻击
+     * @dev 为什么需要重入锁？
+     *      因为 Pool 使用余额检查来验证支付：
+     *      1. 记录转账前余额
+     *      2. 调用回调函数（外部调用！）
+     *      3. 检查转账后余额
+     *      
+     *      如果没有重入锁，恶意合约可以在回调中再次调用 Pool，
+     *      导致余额检查失效。
+     *      
+     *      例如：mint → 回调 → 恶意再次 mint → 余额检查通过（但实际没支付）
+     */
     modifier lock() {
-        require(slot0.unlocked, 'LOK');
-        slot0.unlocked = false;
-        _;
-        slot0.unlocked = true;
+        require(slot0.unlocked, 'LOK');  // 检查是否已锁定
+        slot0.unlocked = false;          // 上锁
+        _;                               // 执行函数
+        slot0.unlocked = true;           // 解锁
     }
 
     /// @dev Prevents calling a function from anyone except the address returned by IUniswapV3Factory#owner()
+    /**
+     * @notice 只允许工厂合约的所有者调用
+     * @dev 用于管理员功能，如设置协议费率、收取协议费用
+     */
     modifier onlyFactoryOwner() {
         require(msg.sender == IUniswapV3Factory(factory).owner());
         _;
@@ -123,6 +140,13 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     }
 
     /// @dev Common checks for valid tick inputs.
+    /**
+     * @notice 验证 tick 范围的有效性
+     * @dev 确保：
+     *      1. tickLower < tickUpper（下界必须小于上界）
+     *      2. tickLower >= MIN_TICK（不能低于最小 tick）
+     *      3. tickUpper <= MAX_TICK（不能高于最大 tick）
+     */
     function checkTicks(int24 tickLower, int24 tickUpper) private pure {
         require(tickLower < tickUpper, 'TLU');
         require(tickLower >= TickMath.MIN_TICK, 'TLM');
@@ -130,6 +154,11 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     }
 
     /// @dev Returns the block timestamp truncated to 32 bits, i.e. mod 2**32. This method is overridden in tests.
+    /**
+     * @notice 获取当前区块时间戳（截断为 32 位）
+     * @dev 截断是有意为之，用于节省存储空间
+     *      32 位时间戳足够使用到 2106 年
+     */
     function _blockTimestamp() internal view virtual returns (uint32) {
         return uint32(block.timestamp); // truncation is desired
     }
@@ -137,6 +166,11 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     /// @dev Get the pool's balance of token0
     /// @dev This function is gas optimized to avoid a redundant extcodesize check in addition to the returndatasize
     /// check
+    /**
+     * @notice 获取 Pool 的 token0 余额
+     * @dev Gas 优化：使用 staticcall 避免冗余的 extcodesize 检查
+     *      这比直接调用 IERC20(token0).balanceOf(address(this)) 更省 gas
+     */
     function balance0() private view returns (uint256) {
         (bool success, bytes memory data) =
             token0.staticcall(abi.encodeWithSelector(IERC20Minimal.balanceOf.selector, address(this)));
@@ -147,6 +181,10 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     /// @dev Get the pool's balance of token1
     /// @dev This function is gas optimized to avoid a redundant extcodesize check in addition to the returndatasize
     /// check
+    /**
+     * @notice 获取 Pool 的 token1 余额
+     * @dev Gas 优化：使用 staticcall 避免冗余的 extcodesize 检查
+     */
     function balance1() private view returns (uint256) {
         (bool success, bytes memory data) =
             token1.staticcall(abi.encodeWithSelector(IERC20Minimal.balanceOf.selector, address(this)));
@@ -288,13 +326,23 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         emit Initialize(sqrtPriceX96, tick);
     }
 
+    /**
+     * @notice 修改 position 的参数结构体
+     * @dev 用于 mint 和 burn 操作
+     */
     struct ModifyPositionParams {
-        // the address that owns the position
+        // position 的所有者
+        // - 如果通过 NPM：owner = NPM 合约地址（多个用户共享）
+        // - 如果直接调用：owner = msg.sender（独立 position）
         address owner;
-        // the lower and upper tick of the position
+        
+        // 价格区间的下界和上界
         int24 tickLower;
         int24 tickUpper;
-        // any change in liquidity
+        
+        // 流动性变化量
+        // - 正数：增加流动性（mint）
+        // - 负数：减少流动性（burn）
         int128 liquidityDelta;
     }
 
@@ -303,6 +351,16 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     /// @return position a storage pointer referencing the position with the given owner and tick range
     /// @return amount0 the amount of token0 owed to the pool, negative if the pool should pay the recipient
     /// @return amount1 the amount of token1 owed to the pool, negative if the pool should pay the recipient
+    /**
+     * @notice 修改 position（增加或减少流动性）
+     * @dev 核心逻辑：
+     *      1. 更新 position 和 tick 的状态
+     *      2. 根据当前价格位置计算需要的代币数量
+     * @param params 包含 owner、价格区间、流动性变化量
+     * @return position 存储引用
+     * @return amount0 token0 的变化量（正数=需要支付，负数=应该收到）
+     * @return amount1 token1 的变化量（正数=需要支付，负数=应该收到）
+     */
     function _modifyPosition(ModifyPositionParams memory params)
         private
         noDelegateCall
@@ -312,10 +370,13 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
             int256 amount1
         )
     {
+        // 验证 tick 范围的有效性
         checkTicks(params.tickLower, params.tickUpper);
 
-        Slot0 memory _slot0 = slot0; // SLOAD for gas optimization
+        // 缓存 slot0（节省 gas）
+        Slot0 memory _slot0 = slot0;
 
+        // 更新 position 和 tick 的状态（手续费、流动性等）
         position = _updatePosition(
             params.owner,
             params.tickLower,
@@ -324,21 +385,36 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
             _slot0.tick
         );
 
-        // 根据实际的liquidityDelta重新计算需要的amount0和amount1
+        // 根据当前价格位置计算需要的代币数量
+        // 关键：Uniswap V3 的集中流动性只在价格区间内有效
         if (params.liquidityDelta != 0) {
             if (_slot0.tick < params.tickLower) {
-                // current tick is below the passed range; liquidity can only become in range by crossing from left to
-                // right, when we'll need _more_ token0 (it's becoming more valuable) so user must provide it
+                // ========== 情况 1：当前价格在区间下方 ==========
+                // 价格 < tickLower，流动性全部是 token0
+                // 
+                // 价格轴：  当前价格 ← | [tickLower ←→ tickUpper]
+                //                    ↑
+                //                 区间下界
+                //
+                // 只需要 token0，不需要 token1
                 amount0 = SqrtPriceMath.getAmount0Delta(
                     TickMath.getSqrtRatioAtTick(params.tickLower),
                     TickMath.getSqrtRatioAtTick(params.tickUpper),
                     params.liquidityDelta
                 );
             } else if (_slot0.tick < params.tickUpper) {
-                // current tick is inside the passed range
-                uint128 liquidityBefore = liquidity; // SLOAD for gas optimization
+                // ========== 情况 2：当前价格在区间内部 ==========
+                // tickLower ≤ 价格 < tickUpper，流动性处于活跃状态
+                //
+                // 价格轴：  [tickLower ← 当前价格 → tickUpper]
+                //                        ↑
+                //                    价格在区间内
+                //
+                // 需要同时提供 token0 和 token1
+                
+                uint128 liquidityBefore = liquidity; // 缓存当前流动性
 
-                // write an oracle entry
+                // 更新预言机（因为流动性变化会影响 TWAP）
                 (slot0.observationIndex, slot0.observationCardinality) = observations.write(
                     _slot0.observationIndex,
                     _blockTimestamp(),
@@ -348,21 +424,31 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                     _slot0.observationCardinalityNext
                 );
 
+                // 计算 token0 数量（当前价格 → 上界）
                 amount0 = SqrtPriceMath.getAmount0Delta(
-                    _slot0.sqrtPriceX96,
-                    TickMath.getSqrtRatioAtTick(params.tickUpper),
+                    _slot0.sqrtPriceX96,                        // 当前价格
+                    TickMath.getSqrtRatioAtTick(params.tickUpper),  // 上界价格
                     params.liquidityDelta
                 );
+                
+                // 计算 token1 数量（下界 → 当前价格）
                 amount1 = SqrtPriceMath.getAmount1Delta(
-                    TickMath.getSqrtRatioAtTick(params.tickLower),
-                    _slot0.sqrtPriceX96,
+                    TickMath.getSqrtRatioAtTick(params.tickLower),  // 下界价格
+                    _slot0.sqrtPriceX96,                        // 当前价格
                     params.liquidityDelta
                 );
 
+                // 更新全局流动性（只有在区间内的流动性才计入全局）
                 liquidity = LiquidityMath.addDelta(liquidityBefore, params.liquidityDelta);
             } else {
-                // current tick is above the passed range; liquidity can only become in range by crossing from right to
-                // left, when we'll need _more_ token1 (it's becoming more valuable) so user must provide it
+                // ========== 情况 3：当前价格在区间上方 ==========
+                // 价格 ≥ tickUpper，流动性全部是 token1
+                //
+                // 价格轴：  [tickLower ←→ tickUpper] | → 当前价格
+                //                                  ↑
+                //                               区间上界
+                //
+                // 只需要 token1，不需要 token0
                 amount1 = SqrtPriceMath.getAmount1Delta(
                     TickMath.getSqrtRatioAtTick(params.tickLower),
                     TickMath.getSqrtRatioAtTick(params.tickUpper),
@@ -377,7 +463,19 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     /// @param tickLower the lower tick of the position's tick range
     /// @param tickUpper the upper tick of the position's tick range
     /// @param tick the current tick, passed to avoid sloads
-    // 根据tick和流动性，计算并且设置tickInside的单位流动性手续费
+    /**
+     * @notice 更新 position 和相关 tick 的状态
+     * @dev 核心功能：
+     *      1. 更新 tick 的流动性和费用累计值
+     *      2. 更新 tickBitmap（标记 tick 是否初始化）
+     *      3. 计算并更新 position 的手续费
+     * @param owner position 的所有者（可能是 NPM 合约或直接调用者）
+     * @param tickLower 价格区间下界
+     * @param tickUpper 价格区间上界
+     * @param liquidityDelta 流动性变化量（正数=增加，负数=减少）
+     * @param tick 当前 tick（避免重复读取存储）
+     * @return position 存储引用
+     */
     function _updatePosition(
         address owner,
         int24 tickLower,
@@ -385,17 +483,20 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         int128 liquidityDelta,
         int24 tick
     ) private returns (Position.Info storage position) {
-        // 获取position（不存在时会返回一个空的position）
+        // 获取或创建 position
+        // 注意：如果是通过 NPM，多个用户可能共享同一个 position（owner = NPM）
         position = positions.get(owner, tickLower, tickUpper);
 
-        // 全局单位流动性费用
-        uint256 _feeGrowthGlobal0X128 = feeGrowthGlobal0X128; // SLOAD for gas optimization
-        uint256 _feeGrowthGlobal1X128 = feeGrowthGlobal1X128; // SLOAD for gas optimization
+        // 缓存全局费用增长（节省 gas）
+        uint256 _feeGrowthGlobal0X128 = feeGrowthGlobal0X128;
+        uint256 _feeGrowthGlobal1X128 = feeGrowthGlobal1X128;
 
-        // if we need to update the ticks, do it
+        // 记录 tick 是否发生翻转（从未初始化→初始化，或反之）
         bool flippedLower;
         bool flippedUpper;
+        
         if (liquidityDelta != 0) {
+            // 获取当前时间和预言机数据
             uint32 time = _blockTimestamp();
             (int56 tickCumulative, uint160 secondsPerLiquidityCumulativeX128) =
                 observations.observeSingle(
@@ -407,18 +508,22 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                     slot0.observationCardinality
                 );
 
+            // 更新下界 tick
+            // flippedLower = true 表示这个 tick 从未初始化变为初始化（或反之）
             flippedLower = ticks.update(
                 tickLower,
-                tick,
-                liquidityDelta,
+                tick,                           // 当前 tick
+                liquidityDelta,                 // 流动性变化
                 _feeGrowthGlobal0X128,
                 _feeGrowthGlobal1X128,
                 secondsPerLiquidityCumulativeX128,
                 tickCumulative,
                 time,
-                false,
+                false,                          // lower = false（下界）
                 maxLiquidityPerTick
             );
+            
+            // 更新上界 tick
             flippedUpper = ticks.update(
                 tickUpper,
                 tick,
@@ -428,10 +533,12 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                 secondsPerLiquidityCumulativeX128,
                 tickCumulative,
                 time,
-                true,
+                true,                           // upper = true（上界）
                 maxLiquidityPerTick
             );
 
+            // 如果 tick 发生翻转，更新 tickBitmap
+            // tickBitmap 用于快速查找下一个初始化的 tick
             if (flippedLower) {
                 tickBitmap.flipTick(tickLower, tickSpacing);
             }
@@ -440,13 +547,16 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
             }
         }
 
+        // 计算区间内的费用增长
+        // 这是计算 position 应得手续费的关键
         (uint256 feeGrowthInside0X128, uint256 feeGrowthInside1X128) =
             ticks.getFeeGrowthInside(tickLower, tickUpper, tick, _feeGrowthGlobal0X128, _feeGrowthGlobal1X128);
 
-        // 更新用户position手续费增长，以及累计的ownToken
+        // 更新 position 的流动性和手续费
+        // 会计算自上次更新以来累积的手续费，并记录到 tokensOwed
         position.update(liquidityDelta, feeGrowthInside0X128, feeGrowthInside1X128);
 
-        // clear any tick data that is no longer needed
+        // 如果是减少流动性，且 tick 不再有流动性，清理 tick 数据
         if (liquidityDelta < 0) {
             if (flippedLower) {
                 ticks.clear(tickLower);
@@ -459,6 +569,21 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
 
     /// @inheritdoc IUniswapV3PoolActions
     /// @dev noDelegateCall is applied indirectly via _modifyPosition
+    /**
+     * @notice 添加流动性到指定价格区间
+     * @dev 可以被任何人调用：
+     *      - 普通用户通过 NonfungiblePositionManager 调用（recipient = NPM 合约）
+     *      - 高级用户/合约直接调用（recipient = 调用者自己）
+     * @param recipient position 的所有者地址
+     *                  - 如果通过 NPM：recipient = NPM 合约地址（所有用户共享 position）
+     *                  - 如果直接调用：recipient = msg.sender（独立 position，不可转让）
+     * @param tickLower 价格区间下界
+     * @param tickUpper 价格区间上界
+     * @param amount 要添加的流动性数量
+     * @param data 传递给回调函数的数据（通常包含付款人信息）
+     * @return amount0 需要支付的 token0 数量
+     * @return amount1 需要支付的 token1 数量
+     */
     function mint(
         address recipient,
         int24 tickLower,
@@ -466,32 +591,59 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         uint128 amount,
         bytes calldata data
     ) external override lock returns (uint256 amount0, uint256 amount1) {
+        // 验证流动性数量大于 0
         require(amount > 0);
+        
+        // 修改 position，计算需要的代币数量
+        // owner = recipient（可能是 NPM 合约，也可能是直接调用者）
         (, int256 amount0Int, int256 amount1Int) =
             _modifyPosition(
                 ModifyPositionParams({
-                    owner: recipient,
+                    owner: recipient,                      // position 的所有者
                     tickLower: tickLower,
                     tickUpper: tickUpper,
-                    liquidityDelta: int256(amount).toInt128()
+                    liquidityDelta: int256(amount).toInt128()  // 正数 = 增加流动性
                 })
             );
 
+        // 转换为 uint256（amount0Int 和 amount1Int 必定为正）
         amount0 = uint256(amount0Int);
         amount1 = uint256(amount1Int);
 
+        // 记录转账前的余额（用于后续验证）
         uint256 balance0Before;
         uint256 balance1Before;
         if (amount0 > 0) balance0Before = balance0();
         if (amount1 > 0) balance1Before = balance1();
+        
+        // 回调调用者，要求支付代币
+        // msg.sender 可能是：
+        // - NonfungiblePositionManager（会从用户转账到 Pool）
+        // - 直接调用的合约（需要实现回调接口）
         IUniswapV3MintCallback(msg.sender).uniswapV3MintCallback(amount0, amount1, data);
+        
+        // 验证支付：检查余额是否增加了足够的数量
         if (amount0 > 0) require(balance0Before.add(amount0) <= balance0(), 'M0');
         if (amount1 > 0) require(balance1Before.add(amount1) <= balance1(), 'M1');
 
+        // 发出事件
         emit Mint(msg.sender, recipient, tickLower, tickUpper, amount, amount0, amount1);
     }
 
     /// @inheritdoc IUniswapV3PoolActions
+    /**
+     * @notice 收取累积的代币（手续费 + burn 后的代币）
+     * @dev 只有 position 的所有者可以调用
+     *      - 如果通过 NPM：msg.sender = NPM 合约，NPM 会验证 NFT 所有权
+     *      - 如果直接创建：msg.sender = position 所有者
+     * @param recipient 接收代币的地址
+     * @param tickLower 价格区间下界
+     * @param tickUpper 价格区间上界
+     * @param amount0Requested 请求收取的 token0 数量（可以小于等于 tokensOwed0）
+     * @param amount1Requested 请求收取的 token1 数量（可以小于等于 tokensOwed1）
+     * @return amount0 实际收取的 token0 数量
+     * @return amount1 实际收取的 token1 数量
+     */
     function collect(
         address recipient,
         int24 tickLower,
@@ -499,51 +651,75 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         uint128 amount0Requested,
         uint128 amount1Requested
     ) external override lock returns (uint128 amount0, uint128 amount1) {
-        // we don't need to checkTicks here, because invalid positions will never have non-zero tokensOwed{0,1}
+        // 获取调用者的 position
+        // 注意：这里不需要 checkTicks，因为无效的 position 不会有 tokensOwed
         Position.Info storage position = positions.get(msg.sender, tickLower, tickUpper);
 
+        // 计算实际可以收取的数量（取请求数量和欠款的较小值）
         amount0 = amount0Requested > position.tokensOwed0 ? position.tokensOwed0 : amount0Requested;
         amount1 = amount1Requested > position.tokensOwed1 ? position.tokensOwed1 : amount1Requested;
 
+        // 收取 token0
         if (amount0 > 0) {
-            position.tokensOwed0 -= amount0;
-            TransferHelper.safeTransfer(token0, recipient, amount0);
+            position.tokensOwed0 -= amount0;  // 减少欠款
+            TransferHelper.safeTransfer(token0, recipient, amount0);  // 转账
         }
+        
+        // 收取 token1
         if (amount1 > 0) {
-            position.tokensOwed1 -= amount1;
-            TransferHelper.safeTransfer(token1, recipient, amount1);
+            position.tokensOwed1 -= amount1;  // 减少欠款
+            TransferHelper.safeTransfer(token1, recipient, amount1);  // 转账
         }
 
+        // 发出事件
         emit Collect(msg.sender, recipient, tickLower, tickUpper, amount0, amount1);
     }
 
     /// @inheritdoc IUniswapV3PoolActions
     /// @dev noDelegateCall is applied indirectly via _modifyPosition
+    /**
+     * @notice 移除流动性（不转账代币，只记录欠款）
+     * @dev 只有 position 的所有者可以调用
+     *      burn 只是减少流动性并计算应得的代币，不实际转账
+     *      需要调用 collect() 来实际收取代币
+     * @param tickLower 价格区间下界
+     * @param tickUpper 价格区间上界
+     * @param amount 要移除的流动性数量
+     * @return amount0 应得的 token0 数量（记录在 tokensOwed0 中）
+     * @return amount1 应得的 token1 数量（记录在 tokensOwed1 中）
+     */
     function burn(
         int24 tickLower,
         int24 tickUpper,
         uint128 amount
     ) external override lock returns (uint256 amount0, uint256 amount1) {
+        // 修改 position，计算应得的代币数量
+        // liquidityDelta 为负数 = 减少流动性
         (Position.Info storage position, int256 amount0Int, int256 amount1Int) =
             _modifyPosition(
                 ModifyPositionParams({
-                    owner: msg.sender,
+                    owner: msg.sender,                      // position 所有者
                     tickLower: tickLower,
                     tickUpper: tickUpper,
-                    liquidityDelta: -int256(amount).toInt128()
+                    liquidityDelta: -int256(amount).toInt128()  // 负数 = 减少流动性
                 })
             );
 
+        // 转换为 uint256（amount0Int 和 amount1Int 为负数，取反后为正）
         amount0 = uint256(-amount0Int);
         amount1 = uint256(-amount1Int);
 
+        // 将应得的代币记录到 tokensOwed 中
+        // 注意：这里不实际转账，只是记账
+        // 用户需要调用 collect() 来实际收取代币
         if (amount0 > 0 || amount1 > 0) {
             (position.tokensOwed0, position.tokensOwed1) = (
-                position.tokensOwed0 + uint128(amount0),
-                position.tokensOwed1 + uint128(amount1)
+                position.tokensOwed0 + uint128(amount0),  // 累加欠款
+                position.tokensOwed1 + uint128(amount1)   // 累加欠款
             );
         }
 
+        // 发出事件
         emit Burn(msg.sender, tickLower, tickUpper, amount, amount0, amount1);
     }
 
@@ -741,6 +917,9 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                 state.feeGrowthGlobalX128 += FullMath.mulDiv(step.feeAmount, FixedPoint128.Q128, state.liquidity);
 
             // --- 步骤6：处理tick跨越 ---
+            // ⚠️ 重要：流动性变化只发生在跨越初始化的tick时！
+            // 如果交换在tick内部进行，流动性保持不变
+            
             // 检查是否到达了下一个tick的价格
             if (state.sqrtPriceX96 == step.sqrtPriceNextX96) {
                 // 只有当tick真的被初始化时才执行跨越操作
@@ -776,7 +955,7 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                     // 从右向左跨越时，需要反向应用这个变化
                     if (zeroForOne) liquidityNet = -liquidityNet;
 
-                    // 更新当前流动性
+                    // ⭐ 更新当前流动性（这是流动性改变的唯一位置！）
                     state.liquidity = LiquidityMath.addDelta(state.liquidity, liquidityNet);
                 }
 
@@ -785,7 +964,7 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                 state.tick = zeroForOne ? step.tickNext - 1 : step.tickNext;
             } else if (state.sqrtPriceX96 != step.sqrtPriceStartX96) {
                 // 价格变化了但没有到达下一个tick（在tick内部移动）
-                // 需要重新计算当前tick（除非价格没变）
+                // ⭐ 注意：这里只更新tick值，流动性保持不变！
                 state.tick = TickMath.getTickAtSqrtRatio(state.sqrtPriceX96);
             }
         } // while循环结束
@@ -881,48 +1060,89 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     }
 
     /// @inheritdoc IUniswapV3PoolActions
+    /**
+     * @notice 闪电贷：借出代币，在同一交易中归还并支付手续费
+     * @dev 典型用途：
+     *      - 套利：借代币 → 在其他 DEX 套利 → 归还 + 手续费
+     *      - 清算：借代币 → 清算抵押品 → 归还 + 手续费
+     *      - 自我对冲：借代币 → 执行复杂策略 → 归还 + 手续费
+     * @param recipient 接收借出代币的地址
+     * @param amount0 借出的 token0 数量
+     * @param amount1 借出的 token1 数量
+     * @param data 传递给回调函数的数据
+     */
     function flash(
         address recipient,
         uint256 amount0,
         uint256 amount1,
         bytes calldata data
     ) external override lock noDelegateCall {
+        // 获取当前流动性（用于计算手续费分配）
         uint128 _liquidity = liquidity;
         require(_liquidity > 0, 'L');
 
+        // 计算手续费（向上取整，确保协议不会亏损）
+        // 手续费率 = pool 的 fee（例如 3000 = 0.3%）
         uint256 fee0 = FullMath.mulDivRoundingUp(amount0, fee, 1e6);
         uint256 fee1 = FullMath.mulDivRoundingUp(amount1, fee, 1e6);
+        
+        // 记录转账前的余额
         uint256 balance0Before = balance0();
         uint256 balance1Before = balance1();
 
+        // ========== 第一步：先转出代币给接收者 ==========
         if (amount0 > 0) TransferHelper.safeTransfer(token0, recipient, amount0);
         if (amount1 > 0) TransferHelper.safeTransfer(token1, recipient, amount1);
 
+        // ========== 第二步：回调调用者，要求归还代币 + 手续费 ==========
+        // 调用者需要在回调中：
+        // 1. 使用借出的代币执行操作（套利、清算等）
+        // 2. 归还借出的代币 + 手续费
         IUniswapV3FlashCallback(msg.sender).uniswapV3FlashCallback(fee0, fee1, data);
 
+        // ========== 第三步：验证归还 ==========
         uint256 balance0After = balance0();
         uint256 balance1After = balance1();
 
+        // 验证余额增加至少等于手续费（借出的代币 + 手续费）
         require(balance0Before.add(fee0) <= balance0After, 'F0');
         require(balance1Before.add(fee1) <= balance1After, 'F1');
 
-        // sub is safe because we know balanceAfter is gt balanceBefore by at least fee
+        // 计算实际支付的金额（可能大于最低要求的手续费）
+        // 这是安全的，因为我们已经验证了 balanceAfter >= balanceBefore + fee
         uint256 paid0 = balance0After - balance0Before;
         uint256 paid1 = balance1After - balance1Before;
 
+        // ========== 第四步：分配手续费 ==========
         if (paid0 > 0) {
+            // 获取协议费率（低 4 位）
             uint8 feeProtocol0 = slot0.feeProtocol % 16;
+            
+            // 计算协议费用（如果 feeProtocol0 = 0，则全部给 LP）
             uint256 fees0 = feeProtocol0 == 0 ? 0 : paid0 / feeProtocol0;
+            
+            // 累加协议费用
             if (uint128(fees0) > 0) protocolFees.token0 += uint128(fees0);
+            
+            // 剩余部分分配给 LP（更新全局费用增长）
             feeGrowthGlobal0X128 += FullMath.mulDiv(paid0 - fees0, FixedPoint128.Q128, _liquidity);
         }
+        
         if (paid1 > 0) {
+            // 获取协议费率（高 4 位）
             uint8 feeProtocol1 = slot0.feeProtocol >> 4;
+            
+            // 计算协议费用
             uint256 fees1 = feeProtocol1 == 0 ? 0 : paid1 / feeProtocol1;
+            
+            // 累加协议费用
             if (uint128(fees1) > 0) protocolFees.token1 += uint128(fees1);
+            
+            // 剩余部分分配给 LP
             feeGrowthGlobal1X128 += FullMath.mulDiv(paid1 - fees1, FixedPoint128.Q128, _liquidity);
         }
 
+        // 发出事件
         emit Flash(msg.sender, recipient, amount0, amount1, paid0, paid1);
     }
 
