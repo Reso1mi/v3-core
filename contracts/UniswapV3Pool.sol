@@ -620,6 +620,7 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         // msg.sender 可能是：
         // - NonfungiblePositionManager（会从用户转账到 Pool）
         // - 直接调用的合约（需要实现回调接口）
+        // data中的 payer 字段才是真正的付款人（用户账户EOA等）
         IUniswapV3MintCallback(msg.sender).uniswapV3MintCallback(amount0, amount1, data);
         
         // 验证支付：检查余额是否增加了足够的数量
